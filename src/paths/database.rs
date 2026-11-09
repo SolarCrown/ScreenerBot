@@ -37,6 +37,12 @@ pub fn get_wallets_db_path() -> PathBuf {
     get_data_directory().join("wallets.db")
 }
 
+/// Returns the research history database path. Candles, launches, liquidity
+/// and lifecycle rows live here and are not part of the evictable trading cache.
+pub fn get_research_db_path() -> PathBuf {
+    get_data_directory().join("research.db")
+}
+
 /// Returns the events database path.
 pub fn get_events_db_path() -> PathBuf {
     get_data_directory().join("events.db")

@@ -64,6 +64,10 @@ pub enum RpcError {
     /// A transaction send was requested inside a paper scope. Paper trading
     /// never sends, so the request is refused before the relay or any provider.
     PaperScopeRefused,
+
+    /// A transaction send was requested in research mode. Nothing is submitted
+    /// for the rest of the process.
+    ResearchModeRefused,
 }
 
 impl RpcError {
@@ -84,7 +88,7 @@ impl RpcError {
             }
             Self::Other(_) => false,
             Self::RefusedAfterDelivery { .. } => false,
-            Self::PaperScopeRefused => false,
+            Self::PaperScopeRefused | Self::ResearchModeRefused => false,
         }
     }
 
@@ -104,7 +108,8 @@ impl RpcError {
             | Self::Configuration { .. }
             | Self::Other(_)
             | Self::RefusedAfterDelivery { .. }
-            | Self::PaperScopeRefused => false,
+            | Self::PaperScopeRefused
+            | Self::ResearchModeRefused => false,
         }
     }
 
@@ -127,6 +132,7 @@ impl RpcError {
                 code: -32700 | -32600 | -32602,
                 ..
             } | Self::PaperScopeRefused
+                | Self::ResearchModeRefused
         )
     }
 
@@ -303,6 +309,9 @@ impl fmt::Display for RpcError {
             Self::PaperScopeRefused => {
                 write!(f, "Transaction send is refused while paper trading")
             }
+            Self::ResearchModeRefused => {
+                write!(f, "Transaction send is refused in research mode")
+            }
         }
     }
 }
@@ -475,6 +484,7 @@ mod tests {
             RpcError::Other(_) => "Other",
             RpcError::RefusedAfterDelivery { .. } => "RefusedAfterDelivery",
             RpcError::PaperScopeRefused => "PaperScopeRefused",
+            RpcError::ResearchModeRefused => "ResearchModeRefused",
         }
     }
 
@@ -583,6 +593,7 @@ mod tests {
                 false,
             ),
             (RpcError::PaperScopeRefused, false, false, true),
+            (RpcError::ResearchModeRefused, false, false, true),
         ];
 
         let mut covered: Vec<&str> = rows.iter().map(|(error, ..)| variant(error)).collect();
@@ -602,6 +613,7 @@ mod tests {
                 "ProviderError",
                 "RateLimited",
                 "RefusedAfterDelivery",
+                "ResearchModeRefused",
                 "Timeout",
             ],
             "every RpcError variant needs a row"

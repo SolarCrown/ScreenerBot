@@ -357,6 +357,7 @@ impl From<crate::swaps::NotSubmittedReason> for DirectSwapError {
             | NotSubmittedReason::CostExceeded { .. }
             | NotSubmittedReason::InsufficientFunds { .. }
             | NotSubmittedReason::PaperScope
+            | NotSubmittedReason::ResearchMode
             | NotSubmittedReason::Halted
             | NotSubmittedReason::RouterUnavailable { .. }
             | NotSubmittedReason::SignerUnavailable { .. }

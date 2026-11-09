@@ -317,6 +317,10 @@ pub enum NotSubmittedReason {
     /// executes a swap, so nothing was built or sent.
     #[error("swap execution is refused while paper trading")]
     PaperScope,
+    /// Swap execution was requested in research mode. Nothing is built or sent
+    /// for the rest of the process.
+    #[error("swap execution is refused in research mode")]
+    ResearchMode,
     /// Trading is halted by a force stop; no router was asked.
     #[error("trading is halted by a force stop")]
     Halted,
@@ -355,7 +359,9 @@ impl NotSubmittedReason {
             NotSubmittedReason::SimulationUnavailable { .. }
             | NotSubmittedReason::RouterUnavailable { .. }
             | NotSubmittedReason::ServicePaused { .. } => 503,
-            NotSubmittedReason::PaperScope | NotSubmittedReason::SignerUnavailable { .. } => 500,
+            NotSubmittedReason::PaperScope
+            | NotSubmittedReason::ResearchMode
+            | NotSubmittedReason::SignerUnavailable { .. } => 500,
             NotSubmittedReason::Halted => 409,
         }
     }

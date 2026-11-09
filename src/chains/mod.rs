@@ -84,6 +84,13 @@ pub fn legacy_row_chain() -> ChainId {
     active_chain()
 }
 
+/// Drop a decrypted trading key held by the active chain. Research mode calls
+/// this so the key does not stay resident after the latch, without shared code
+/// naming a chain module.
+pub fn discard_cached_signer() {
+    solana::accounts::signing::discard_cached_main_keypair();
+}
+
 /// The chain this process operates on: the single enabled chain, frozen from
 /// `[chains]` config at first read. With one supported chain and
 /// default config that is Solana. This is the single operational selection

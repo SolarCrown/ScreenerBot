@@ -501,13 +501,19 @@ async fn execute_with_fallback_on(
     quote: Quote,
     amount_limit: SwapAmountLimit,
 ) -> Result<(Quote, SwapResult)> {
-    // Paper trading never executes a swap: refused before any router, key or
-    // balance read.
-    if crate::global::in_paper_scope() {
+    // Research mode and paper trading never execute a swap: refused before any
+    // router, key or balance read. Research mode holds for every task in the
+    // process, including one spawned from the caller.
+    if crate::global::in_research_mode() || crate::global::in_paper_scope() {
+        let reason = if crate::global::in_research_mode() {
+            crate::swaps::NotSubmittedReason::ResearchMode
+        } else {
+            crate::swaps::NotSubmittedReason::PaperScope
+        };
         return Err(Error::Swaps(
             crate::swaps::SwapExecutionError::NotSubmitted {
                 router: quote.router_name.clone(),
-                reason: crate::swaps::NotSubmittedReason::PaperScope,
+                reason,
             },
         ));
     }
@@ -1152,7 +1158,8 @@ fn solana_fallback_safe(error: &crate::chains::solana::Error) -> bool {
         | Solana::Decode { .. }
         | Solana::InvalidPool { .. }
         | Solana::InstructionBuild { .. }
-        | Solana::PaperScopeRefused { .. } => false,
+        | Solana::PaperScopeRefused { .. }
+        | Solana::ResearchModeRefused { .. } => false,
     }
 }
 
@@ -2186,6 +2193,7 @@ mod tests {
             NotSubmittedReason::SimulationUnavailable { .. } => "SimulationUnavailable",
             NotSubmittedReason::InsufficientFunds { .. } => "InsufficientFunds",
             NotSubmittedReason::PaperScope => "PaperScope",
+            NotSubmittedReason::ResearchMode => "ResearchMode",
             NotSubmittedReason::Halted => "Halted",
             NotSubmittedReason::RouterUnavailable { .. } => "RouterUnavailable",
             NotSubmittedReason::SignerUnavailable { .. } => "SignerUnavailable",
@@ -2218,6 +2226,7 @@ mod tests {
             Solana::DirectSwap(_) => "DirectSwap",
             Solana::NotSent(_) => "NotSent",
             Solana::PaperScopeRefused { .. } => "PaperScopeRefused",
+            Solana::ResearchModeRefused { .. } => "ResearchModeRefused",
         }
     }
 
@@ -2331,6 +2340,7 @@ mod tests {
             ),
             // Refused inside a paper scope before any router was asked.
             (not_submitted(NotSubmittedReason::PaperScope), true),
+            (not_submitted(NotSubmittedReason::ResearchMode), true),
             // Refused before any router was asked, or before anything was signed:
             // a force stop, a missing or disabled router, a signing key that did not
             // load, a quote that cannot be executed as it stands.
@@ -2476,6 +2486,12 @@ mod tests {
             ),
             (
                 Error::Solana(Solana::PaperScopeRefused {
+                    operation: "main_keypair",
+                }),
+                false,
+            ),
+            (
+                Error::Solana(Solana::ResearchModeRefused {
                     operation: "main_keypair",
                 }),
                 false,
@@ -2656,9 +2672,9 @@ mod tests {
 
         let covered: std::collections::BTreeSet<String> =
             rows.iter().map(|(error, _)| row_name(error)).collect();
-        let reasons = 14;
+        let reasons = 15;
         let execution_variants = 5;
-        let solana_outside_direct = 12 + execution_variants;
+        let solana_outside_direct = 13 + execution_variants;
         let direct_variants = 20;
         let swap_rows = covered
             .iter()
@@ -2860,6 +2876,29 @@ mod tests {
             error,
             Error::Swaps(SwapExecutionError::NotSubmitted {
                 reason: NotSubmittedReason::PaperScope,
+                ..
+            })
+        ));
+        assert!(executed.lock().unwrap().is_empty());
+    }
+
+    /// Research mode refuses the swap from a spawned task, before any router runs.
+    #[tokio::test]
+    async fn research_mode_refuses_swap_execution_from_a_spawned_task() {
+        let (registry, executed) = chain(Execution::Lands);
+        crate::global::engage_research_mode();
+        let token = traded_token();
+        let quote = primary_quote();
+        let error = tokio::spawn(async move {
+            execute_with_fallback_on(&registry, &token, quote, SwapAmountLimit::Unrestricted).await
+        })
+        .await
+        .expect("spawn")
+        .expect_err("research mode never executes a swap");
+        assert!(matches!(
+            error,
+            Error::Swaps(SwapExecutionError::NotSubmitted {
+                reason: NotSubmittedReason::ResearchMode,
                 ..
             })
         ));

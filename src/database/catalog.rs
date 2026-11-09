@@ -472,6 +472,24 @@ pub const AI_CHAT: StoreSpec = shared(
         bounded("tool_executions"),
     ],
 );
+pub const RESEARCH: StoreSpec = shared(
+    "research",
+    paths::get_research_db_path,
+    configure::RESEARCH_DB,
+    StoreClass::Ledger,
+    crate::research::store::SCHEMA,
+    &[],
+    &[
+        keep("datasets", Ledger),
+        keep("ingest_runs", Ledger),
+        keep("source_health", Aggregate),
+        keep("mints", Ledger),
+        keep("pools", Ledger),
+        keep("candles", Ledger),
+        keep("liquidity_observations", Ledger),
+        keep("gaps", Ledger),
+    ],
+);
 pub const TRANSACTIONS: StoreSpec = shared(
     "transactions",
     paths::get_transactions_db_path,
@@ -603,7 +621,7 @@ pub const ATA_CLEANUP: StoreSpec = shared(
 .pooled(3, Some(1));
 
 /// Every app-owned store, vault first and caches last.
-pub const STORES: [&StoreSpec; 17] = [
+pub const STORES: [&StoreSpec; 18] = [
     &WALLETS,
     &POSITIONS,
     &PAPER_POSITIONS,
@@ -612,6 +630,7 @@ pub const STORES: [&StoreSpec; 17] = [
     &AGENT_CONTROL,
     &AI,
     &AI_CHAT,
+    &RESEARCH,
     &TRANSACTIONS,
     &WALLET,
     &TOKENS,
