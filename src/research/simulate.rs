@@ -6,9 +6,11 @@
 //! A decision uses only bars that have closed. The fill, if the next bar exists
 //! and is the next timestamp of this timeframe, is that bar's open adjusted for
 //! pool-reserve slippage and fees. A missing next bar, a missing reserve, a
-//! rugged mint, or a gap is a recorded rejection or an unresolved open. It is
-//! not a profit. Each run has its own cash balance. Results are written to
-//! `backtest_runs` and `backtest_trades`, not to a forward-test book.
+//! rugged mint, or a gap is a recorded rejection. It is not a profit. A position
+//! still open on the last bar is force-closed at that bar's close, with the
+//! same costs, or written off when no reserve exists at that time. Each run has
+//! its own cash balance. Results are written to `backtest_runs` and
+//! `backtest_trades`, not to a forward-test book.
 
 use std::collections::BTreeMap;
 
@@ -45,6 +47,33 @@ pub enum EntryRule {
     CloseRise { lookback: usize, min_pct: f64 },
     /// The closed bar's close is strictly above `level`.
     CloseAbove { level: f64 },
+    /// Volume on the closed bar is at least `multiple` times the average of the
+    /// previous `lookback` bars, and the close is above the previous close.
+    VolumeBreakout { lookback: usize, multiple: f64 },
+    /// The closed bar's close is at least `drop_pct` below the mean of the
+    /// last `lookback` closes, including this bar.
+    MeanRevert { lookback: usize, drop_pct: f64 },
+    /// The pool's born time is within `max_age_seconds`, and the close is up
+    /// at least `min_rise_pct` from the previous close (or this bar's open).
+    EarlyEntry {
+        max_age_seconds: i64,
+        min_rise_pct: f64,
+    },
+    /// The quote reserve observed at or before the signal bar is at least
+    /// `min_sol`, and `inner` is also true. The reserve is not taken from a
+    /// later bar.
+    MinReserve { min_sol: f64, inner: Box<EntryRule> },
+    /// At least `min_fraction` of the mints that have a bar at this timestamp
+    /// closed up, and `inner` is also true.
+    BreadthFilter {
+        min_fraction: f64,
+        inner: Box<EntryRule>,
+    },
+    /// Enter on the first bar that can fill, then hold. Exits are only the
+    /// terminal mark, unless stop or take-profit fields are also set.
+    BuyAndHold,
+    /// No entry. Used for the cash benchmark.
+    Never,
 }
 
 /// A higher timeframe whose last *closed* bar must be an up bar. A bar is
@@ -125,7 +154,25 @@ pub struct BacktestReport {
     pub rejected: usize,
     pub open_unresolved: usize,
     pub notes: String,
+    pub performance: Performance,
     pub(crate) trades: Vec<BacktestTradeRow>,
+}
+
+/// P&L after terminal marks. Unrealized is whatever mark is still open.
+/// Force-close and write-off leave it at zero.
+#[derive(Debug, Clone)]
+pub struct Performance {
+    pub ending_equity_sol: f64,
+    pub realized_pnl_sol: f64,
+    pub unrealized_pnl_sol: f64,
+    pub return_pct: f64,
+    pub closed_trades: usize,
+    pub winning_trades: usize,
+    pub win_rate: f64,
+    pub profit_factor: Option<f64>,
+    pub max_drawdown_pct: f64,
+    pub tokens_bought: usize,
+    pub reject_reasons: BTreeMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -135,6 +182,7 @@ struct Bar {
     high: f64,
     low: f64,
     close: f64,
+    volume: f64,
     pool: String,
 }
 
@@ -245,11 +293,8 @@ pub fn run(store: &mut ResearchStore, config: &BacktestConfig) -> Result<Backtes
         .iter()
         .filter(|trade| trade.reason == "open_unresolved")
         .count();
-    let ending_cash_sol = trades
-        .iter()
-        .rev()
-        .find_map(|trade| trade.cash_after)
-        .unwrap_or(config.starting_cash_sol);
+    let performance = performance(config.starting_cash_sol, chain_fee_sol(config), &trades);
+    let ending_cash_sol = performance.ending_equity_sol - performance.unrealized_pnl_sol;
     let notes = coverage_notes(config, &candles, &mints, &liquidity);
     let run_id = sha256_hex(&format!("{config_hash}|{data_hash}|{}", config.strategy_id));
     let row = BacktestRunRow {
@@ -282,6 +327,7 @@ pub fn run(store: &mut ResearchStore, config: &BacktestConfig) -> Result<Backtes
         rejected,
         open_unresolved,
         notes,
+        performance,
         trades,
     })
 }
@@ -298,6 +344,7 @@ fn simulate(
     let higher_bars = group_bars(higher);
     let info = mint_info(mints);
     let reserves = reserves_by_mint(liquidity);
+    let breadth = breadth_by_ts(&bars);
     let mut trades = Vec::new();
     let mut cash = config.starting_cash_sol;
 
@@ -420,7 +467,16 @@ fn simulate(
                     continue;
                 }
             }
-            if position.is_none() && signal(config, series, index) {
+            if position.is_none()
+                && signal(
+                    config,
+                    series,
+                    index,
+                    state.born_at,
+                    reserve_series,
+                    &breadth,
+                )
+            {
                 if !eligible(state, bar.ts) {
                     let reason = if terminal(state, bar.ts) {
                         "not_in_universe"
@@ -467,20 +523,30 @@ fn simulate(
                 }
             }
         }
-        if position.is_some() {
-            trades.push(BacktestTradeRow {
-                mint: mint.clone(),
-                side: "reject".into(),
-                reason: "open_unresolved".into(),
-                signal_ts: series.last().map(|bar| bar.ts),
-                fill_ts: None,
-                fill_price: None,
-                size_sol: None,
-                fee_sol: None,
-                slippage_pct: None,
-                cash_after: Some(cash),
-                pnl_sol: None,
-            });
+        if let Some(held) = position.take() {
+            if let Some(last) = series.last() {
+                let mark = Bar {
+                    ts: last.ts,
+                    open: last.close,
+                    high: last.close,
+                    low: last.close,
+                    close: last.close,
+                    volume: last.volume,
+                    pool: last.pool.clone(),
+                };
+                let _ = apply_sell(
+                    config,
+                    mint,
+                    last.ts,
+                    &mark,
+                    100.0,
+                    "mark_to_market",
+                    reserve_series,
+                    &mut cash,
+                    &mut trades,
+                    held,
+                );
+            }
         }
     }
     trades
@@ -679,20 +745,197 @@ fn dca_multiplier(config: &BacktestConfig, held: &Position, close: f64, ts: i64)
     }
 }
 
-fn signal(config: &BacktestConfig, series: &[Bar], index: usize) -> bool {
-    let close = series[index].close;
-    match config.entry {
-        EntryRule::CloseAbove { level } => close > level,
+fn signal(
+    config: &BacktestConfig,
+    series: &[Bar],
+    index: usize,
+    born_at: i64,
+    reserves: Option<&Vec<Reserve>>,
+    breadth: &BTreeMap<i64, f64>,
+) -> bool {
+    let bar = &series[index];
+    match &config.entry {
+        EntryRule::Never => false,
+        EntryRule::BuyAndHold => true,
+        EntryRule::CloseAbove { level } => bar.close > *level,
         EntryRule::CloseRise { lookback, min_pct } => {
-            if lookback == 0 || index < lookback {
-                return false;
-            }
-            let prior = series[index - lookback].close;
-            if !(prior.is_finite() && prior > 0.0) {
-                return false;
-            }
-            (close / prior - 1.0) * 100.0 >= min_pct
+            close_rise(series, index, *lookback, *min_pct)
         }
+        EntryRule::VolumeBreakout { lookback, multiple } => {
+            if *lookback == 0 || index < *lookback {
+                return false;
+            }
+            let average = series[index - lookback..index]
+                .iter()
+                .map(|prior| prior.volume)
+                .sum::<f64>()
+                / *lookback as f64;
+            average > 0.0 && bar.volume >= average * multiple && close_rise(series, index, 1, 0.0)
+        }
+        EntryRule::MeanRevert { lookback, drop_pct } => {
+            if *lookback == 0 || index + 1 < *lookback {
+                return false;
+            }
+            let mean = series[index + 1 - lookback..=index]
+                .iter()
+                .map(|prior| prior.close)
+                .sum::<f64>()
+                / *lookback as f64;
+            mean > 0.0 && (mean - bar.close) / mean * 100.0 >= *drop_pct
+        }
+        EntryRule::EarlyEntry {
+            max_age_seconds,
+            min_rise_pct,
+        } => {
+            if bar.ts < born_at || bar.ts - born_at > *max_age_seconds {
+                return false;
+            }
+            let base = if index == 0 {
+                series[0].open
+            } else {
+                series[index - 1].close
+            };
+            base > 0.0 && (bar.close / base - 1.0) * 100.0 >= *min_rise_pct
+        }
+        EntryRule::MinReserve { min_sol, inner } => {
+            let Some(reserve) = reserve_at(reserves, bar.ts) else {
+                return false;
+            };
+            reserve >= *min_sol
+                && signal(
+                    &inner_config(config, inner),
+                    series,
+                    index,
+                    born_at,
+                    reserves,
+                    breadth,
+                )
+        }
+        EntryRule::BreadthFilter {
+            min_fraction,
+            inner,
+        } => {
+            let Some(fraction) = breadth.get(&bar.ts) else {
+                return false;
+            };
+            *fraction >= *min_fraction
+                && signal(
+                    &inner_config(config, inner),
+                    series,
+                    index,
+                    born_at,
+                    reserves,
+                    breadth,
+                )
+        }
+    }
+}
+
+fn inner_config(config: &BacktestConfig, inner: &EntryRule) -> BacktestConfig {
+    let mut inner_config = config.clone();
+    inner_config.entry = inner.clone();
+    inner_config
+}
+
+fn close_rise(series: &[Bar], index: usize, lookback: usize, min_pct: f64) -> bool {
+    if lookback == 0 || index < lookback {
+        return false;
+    }
+    let prior = series[index - lookback].close;
+    prior.is_finite() && prior > 0.0 && (series[index].close / prior - 1.0) * 100.0 >= min_pct
+}
+
+fn breadth_by_ts(bars: &BTreeMap<String, Vec<Bar>>) -> BTreeMap<i64, f64> {
+    let mut up = BTreeMap::<i64, usize>::new();
+    let mut total = BTreeMap::<i64, usize>::new();
+    for series in bars.values() {
+        for bar in series {
+            *total.entry(bar.ts).or_default() += 1;
+            if bar.close > bar.open {
+                *up.entry(bar.ts).or_default() += 1;
+            }
+        }
+    }
+    total
+        .into_iter()
+        .map(|(ts, count)| {
+            let risen = up.get(&ts).copied().unwrap_or(0);
+            (ts, risen as f64 / count as f64)
+        })
+        .collect()
+}
+
+pub(crate) fn performance(start: f64, chain_fee: f64, trades: &[BacktestTradeRow]) -> Performance {
+    let mut cash = start;
+    let mut open: BTreeMap<String, f64> = BTreeMap::new();
+    let mut curve = vec![start];
+    let mut gross_win = 0.0;
+    let mut gross_loss = 0.0;
+    let mut closed = 0;
+    let mut winning = 0;
+    let mut bought = BTreeMap::<String, ()>::new();
+    let mut reject_reasons = BTreeMap::new();
+    for trade in trades {
+        if trade.side == "reject" {
+            *reject_reasons.entry(trade.reason.clone()).or_default() += 1;
+            continue;
+        }
+        if let Some(after) = trade.cash_after {
+            cash = after;
+        }
+        if trade.side == "buy" {
+            bought.insert(trade.mint.clone(), ());
+            let fee = trade.fee_sol.unwrap_or(0.0);
+            let size = trade.size_sol.unwrap_or(0.0);
+            let platform = (fee - chain_fee).max(0.0);
+            *open.entry(trade.mint.clone()).or_default() += (size - platform).max(0.0);
+        } else if trade.side == "sell" {
+            open.remove(&trade.mint);
+            if let Some(pnl) = trade.pnl_sol {
+                closed += 1;
+                if pnl > 0.0 {
+                    winning += 1;
+                    gross_win += pnl;
+                } else if pnl < 0.0 {
+                    gross_loss += -pnl;
+                }
+            }
+        }
+        curve.push(cash + open.values().sum::<f64>());
+    }
+    let ending = *curve.last().unwrap_or(&start);
+    let unrealized = open.values().sum::<f64>();
+    let realized = ending - start - unrealized;
+    let mut peak = start;
+    let mut max_drawdown_pct: f64 = 0.0;
+    for equity in &curve {
+        if *equity > peak {
+            peak = *equity;
+        }
+        if peak > 0.0 {
+            max_drawdown_pct = max_drawdown_pct.max((peak - *equity) / peak * 100.0);
+        }
+    }
+    Performance {
+        ending_equity_sol: ending,
+        realized_pnl_sol: realized,
+        unrealized_pnl_sol: unrealized,
+        return_pct: if start > 0.0 {
+            (ending / start - 1.0) * 100.0
+        } else {
+            0.0
+        },
+        closed_trades: closed,
+        winning_trades: winning,
+        win_rate: if closed == 0 {
+            0.0
+        } else {
+            winning as f64 / closed as f64
+        },
+        profit_factor: (gross_loss > 0.0).then_some(gross_win / gross_loss),
+        max_drawdown_pct,
+        tokens_bought: bought.len(),
+        reject_reasons,
     }
 }
 
@@ -751,6 +994,7 @@ fn group_bars(candles: &[StoredCandle]) -> BTreeMap<String, Vec<Bar>> {
             high: candle.high,
             low: candle.low,
             close: candle.close,
+            volume: candle.volume,
             pool: candle.pool.clone(),
         });
     }
@@ -1468,5 +1712,109 @@ mod tests {
             parsed,
             Err(crate::chains::solana::Error::ResearchModeRefused { .. })
         ));
+    }
+
+    #[test]
+    fn an_open_position_is_marked_at_the_last_close_with_costs() {
+        let (_dir, mut store) = store();
+        ingest(
+            &mut store,
+            "Mark",
+            "1m",
+            60,
+            &[
+                (0, 10.0, 10.0, 10.0),
+                (60, 10.0, 10.0, 80.0),
+                (120, 11.0, 11.0, 9.0),
+            ],
+        );
+        reserve(&mut store, "Mark", 0, 1_000.0);
+        let mut config = BacktestConfig::app_fees("mark", "1m", 60);
+        config.entry = EntryRule::CloseAbove { level: 50.0 };
+        config.order_sol = 0.05;
+        config.stop_loss_pct = None;
+        config.take_profit_pct = None;
+        let report = run(&mut store, &config).unwrap();
+        let marked = report
+            .trades
+            .iter()
+            .find(|trade| trade.reason == "mark_to_market")
+            .unwrap();
+        assert_eq!(marked.side, "sell");
+        assert_eq!(marked.fill_ts, Some(120));
+        let price = marked.fill_price.unwrap();
+        assert!(price < 9.0, "mark {price} did not pay slippage");
+        assert!(marked.pnl_sol.unwrap() < 0.0);
+        assert!(report.performance.unrealized_pnl_sol.abs() < 1e-9);
+        assert!(report.performance.ending_equity_sol < config.starting_cash_sol);
+        assert_eq!(report.performance.closed_trades, 1);
+        assert!(report.open_unresolved == 0);
+    }
+
+    #[test]
+    fn a_terminal_mark_that_cannot_sell_is_a_loss() {
+        let (_dir, mut store) = store();
+        ingest(
+            &mut store,
+            "Writeoff",
+            "1m",
+            60,
+            &[
+                (0, 1.0, 1.0, 60.0),
+                (60, 1.0, 1.0, 1.0),
+                (120, 80.0, 80.0, 80.0),
+            ],
+        );
+        reserve(&mut store, "Writeoff", 0, 1_000.0);
+        let mut config = BacktestConfig::app_fees("writeoff", "1m", 60);
+        config.entry = EntryRule::CloseAbove { level: 50.0 };
+        config.order_sol = 0.05;
+        config.max_reserve_fraction = 0.001;
+        config.stop_loss_pct = None;
+        config.take_profit_pct = None;
+        let report = run(&mut store, &config).unwrap();
+        let sell = report
+            .trades
+            .iter()
+            .find(|trade| trade.side == "sell")
+            .unwrap();
+        assert_eq!(sell.reason, "exit_unfillable");
+        assert!(sell.pnl_sol.unwrap() < 0.0);
+        assert!(report.performance.ending_equity_sol < config.starting_cash_sol);
+        assert!(report.performance.return_pct < 0.0);
+    }
+
+    #[test]
+    fn breadth_uses_only_the_bars_closed_at_the_decision() {
+        let (_dir, mut store) = store();
+        ingest(
+            &mut store,
+            "Up",
+            "1m",
+            60,
+            &[(0, 1.0, 1.0, 2.0), (60, 2.0, 2.0, 1.0)],
+        );
+        ingest(
+            &mut store,
+            "Down",
+            "1m",
+            60,
+            &[(0, 1.0, 1.0, 0.5), (60, 0.5, 0.5, 0.4)],
+        );
+        reserve(&mut store, "Up", 0, 1_000.0);
+        reserve(&mut store, "Down", 0, 1_000.0);
+        let mut config = BacktestConfig::app_fees("breadth", "1m", 60);
+        config.entry = EntryRule::BreadthFilter {
+            min_fraction: 0.6,
+            inner: Box::new(EntryRule::CloseAbove { level: 0.0 }),
+        };
+        config.stop_loss_pct = None;
+        config.take_profit_pct = None;
+        let report = run(&mut store, &config).unwrap();
+        assert!(buys(&report).is_empty(), "{:?}", report.trades);
+        assert_eq!(
+            report.performance.ending_equity_sol,
+            config.starting_cash_sol
+        );
     }
 }
