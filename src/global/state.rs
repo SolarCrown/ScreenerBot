@@ -375,7 +375,8 @@ tokio::task_local! {
 
 /// Run `future` as paper trading. Key access, swap execution and transaction
 /// send refuse to run inside it. The scope is task-local: a task spawned from
-/// inside it runs outside it, so paper code never spawns.
+/// inside it runs outside it, so paper code never spawns. Research mode is the
+/// process-wide latch that still holds across a spawn; see `research_mode`.
 pub async fn paper_scope<F: std::future::Future>(future: F) -> F::Output {
     PAPER_SCOPE.scope((), future).await
 }

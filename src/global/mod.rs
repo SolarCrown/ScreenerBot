@@ -6,9 +6,11 @@
 //! Provides initialization flags, service readiness tracking, GUI mode security,
 //! tools execution state, dashboard focus, and emergency force-stop controls.
 
+mod research_mode;
 mod security;
 mod state;
 
+pub use research_mode::*;
 pub use security::*;
 pub use state::*;
 

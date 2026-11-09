@@ -39,6 +39,7 @@ pub mod paths;
 pub mod pools;
 pub mod positions;
 pub mod process;
+pub mod research;
 pub mod rpc;
 pub mod run;
 pub mod secure_storage;

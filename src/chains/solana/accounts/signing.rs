@@ -31,9 +31,22 @@ struct CachedMainKeypair {
 static MAIN_KEYPAIR_CACHE: LazyLock<RwLock<Option<CachedMainKeypair>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Refuse key material inside a paper scope. Every accessor calls this first,
-/// before any key or database read.
-pub(super) fn refuse_in_paper_scope(operation: &'static str) -> Result<()> {
+/// Drop the cached trading key. Research mode calls this as it latches, so a
+/// key decrypted before the latch does not stay resident. If a reader holds
+/// the lock, that reader re-checks the latch before it returns a copy.
+pub(crate) fn discard_cached_main_keypair() {
+    if let Ok(mut cache) = MAIN_KEYPAIR_CACHE.try_write() {
+        *cache = None;
+    }
+}
+
+/// Refuse key material in research mode and inside a paper scope. Every
+/// accessor calls this before any key or database read, and again before it
+/// returns key material, so a latch that flips during the read still refuses.
+pub(super) fn refuse_key_access(operation: &'static str) -> Result<()> {
+    if crate::global::in_research_mode() {
+        return Err(Error::ResearchModeRefused { operation });
+    }
     if crate::global::in_paper_scope() {
         return Err(Error::PaperScopeRefused { operation });
     }
@@ -53,11 +66,14 @@ fn clone_keypair(keypair: &Keypair) -> Result<Keypair> {
 /// of the process. Every caller gets its own clone; nothing outside this
 /// module ever holds the cached original.
 pub async fn main_keypair() -> Result<Keypair> {
-    refuse_in_paper_scope("main_keypair")?;
+    refuse_key_access("main_keypair")?;
     {
         let cache = MAIN_KEYPAIR_CACHE.read().await;
         if let Some(cached) = cache.as_ref() {
-            return clone_keypair(&cached.keypair);
+            let clone = clone_keypair(&cached.keypair)?;
+            drop(cache);
+            refuse_key_access("main_keypair")?;
+            return Ok(clone);
         }
     }
 
@@ -72,14 +88,23 @@ pub async fn main_keypair() -> Result<Keypair> {
 
     let keypair = decrypt_to_keypair(&ciphertext, &nonce)?;
     let clone = clone_keypair(&keypair)?;
+    refuse_key_access("main_keypair")?;
 
     *MAIN_KEYPAIR_CACHE.write().await = Some(CachedMainKeypair { wallet_id, keypair });
+    if let Err(error) = refuse_key_access("main_keypair") {
+        discard_cached_main_keypair();
+        return Err(error);
+    }
     Ok(clone)
 }
 
 /// The main wallet's database ID, if a keypair is currently cached — cheap
 /// identity check that never touches key material.
 pub async fn cached_main_wallet_id() -> Option<i64> {
+    if crate::global::in_research_mode() {
+        discard_cached_main_keypair();
+        return None;
+    }
     MAIN_KEYPAIR_CACHE
         .read()
         .await
@@ -91,7 +116,7 @@ pub async fn cached_main_wallet_id() -> Option<i64> {
 /// signature. Not cached and never used to sign a transaction: only the main
 /// wallet signs swaps and transfers.
 async fn keypair_for_wallet(wallet_id: i64) -> Result<Keypair> {
-    refuse_in_paper_scope("keypair_for_wallet")?;
+    refuse_key_access("keypair_for_wallet")?;
     let (ciphertext, nonce) = crate::wallets::get_wallet_encrypted_key(wallet_id)
         .await
         .map_err(|e| Error::KeypairUnavailable {
@@ -104,7 +129,7 @@ async fn keypair_for_wallet(wallet_id: i64) -> Result<Keypair> {
 /// bot signs something that is not a transaction: proving wallet ownership
 /// to screenerbot.io during account sign-in.
 pub async fn sign_message_with_main_wallet(message: &str) -> Result<String> {
-    refuse_in_paper_scope("sign_message_with_main_wallet")?;
+    refuse_key_access("sign_message_with_main_wallet")?;
     let keypair = main_keypair().await?;
     Ok(keypair.sign_message(message.as_bytes()).to_string())
 }
@@ -116,7 +141,7 @@ pub async fn sign_message_with_main_wallet(message: &str) -> Result<String> {
 pub async fn sign_message_for_active_wallets(
     message_for: impl Fn(&str) -> String,
 ) -> Result<Vec<(String, String)>> {
-    refuse_in_paper_scope("sign_message_for_active_wallets")?;
+    refuse_key_access("sign_message_for_active_wallets")?;
     let wallets =
         crate::wallets::list_active_wallets()
             .await
@@ -156,7 +181,7 @@ pub async fn sign_message_for_active_wallets(
 /// Async form of [`configured_keypair`], for callers already running on an
 /// executor. Prefer this over the sync bridge when the caller is `async fn`.
 pub async fn configured_keypair_async() -> Result<Keypair> {
-    refuse_in_paper_scope("configured_keypair_async")?;
+    refuse_key_access("configured_keypair_async")?;
     if crate::wallets::is_initialized().await {
         return main_keypair().await;
     }
@@ -198,7 +223,7 @@ pub async fn configured_address_async() -> Result<String> {
 /// a current-thread caller gets a clear error telling it to use
 /// `configured_keypair_async()` instead — never a hang.
 pub fn configured_keypair() -> Result<Keypair> {
-    refuse_in_paper_scope("configured_keypair")?;
+    refuse_key_access("configured_keypair")?;
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
@@ -218,7 +243,7 @@ pub fn configured_keypair() -> Result<Keypair> {
 /// Fallback: decrypt the wallet stored directly in `config.toml`, used only
 /// before the wallet store initializes.
 fn configured_keypair_from_legacy_config() -> Result<Keypair> {
-    refuse_in_paper_scope("configured_keypair_from_legacy_config")?;
+    refuse_key_access("configured_keypair_from_legacy_config")?;
     crate::config::with_config(|cfg| {
         if cfg.wallet_encrypted.is_empty() || cfg.wallet_nonce.is_empty() {
             return Err(Error::KeypairUnavailable {
@@ -349,5 +374,31 @@ mod tests {
         let original = Keypair::new();
         let cloned = clone_keypair(&original).unwrap();
         assert_eq!(original.pubkey(), cloned.pubkey());
+    }
+
+    #[tokio::test]
+    async fn research_mode_refuses_key_parsing_from_a_spawned_task() {
+        let (address, secret) = super::super::keypair::new_test_key();
+        let parsed = super::super::keypair::parse_private_key(&secret).expect("parse before latch");
+        assert_eq!(parsed.pubkey().to_string(), address);
+
+        crate::global::engage_research_mode();
+        let secret_for_task = secret.clone();
+        let parsed =
+            tokio::spawn(async move { super::super::keypair::parse_private_key(&secret_for_task) })
+                .await
+                .expect("spawn");
+        match parsed {
+            Err(Error::ResearchModeRefused { operation }) => {
+                assert_eq!(operation, "parse_private_key")
+            }
+            other => panic!("spawned parse returned {other:?}"),
+        }
+        let loaded = tokio::spawn(main_keypair()).await.expect("spawn");
+        match loaded {
+            Err(Error::ResearchModeRefused { operation }) => assert_eq!(operation, "main_keypair"),
+            other => panic!("spawned main_keypair returned {other:?}"),
+        }
+        assert!(cached_main_wallet_id().await.is_none());
     }
 }

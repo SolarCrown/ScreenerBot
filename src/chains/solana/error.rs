@@ -74,6 +74,10 @@ pub enum Error {
     /// signs, so the request is refused before any key or database read.
     #[error("{operation} is refused while paper trading")]
     PaperScopeRefused { operation: &'static str },
+    /// Key material was requested in research mode. The process will not load
+    /// a signing key until it exits.
+    #[error("{operation} is refused in research mode")]
+    ResearchModeRefused { operation: &'static str },
 }
 
 /// Result alias for the Solana chain adapter.
@@ -113,7 +117,7 @@ impl ErrorClass for Error {
             // The caller rebuilds and re-signs a refused transaction; it is
             // never sent again from here.
             Error::NotSent(_) => false,
-            Error::PaperScopeRefused { .. } => false,
+            Error::PaperScopeRefused { .. } | Error::ResearchModeRefused { .. } => false,
         }
     }
 
@@ -142,7 +146,9 @@ impl ErrorClass for Error {
             // Nothing was sent, so nothing moved.
             Error::NotSent(_) => Severity::Warning,
             // Nothing was signed, but a paper path reached key material.
-            Error::PaperScopeRefused { .. } => Severity::Critical,
+            Error::PaperScopeRefused { .. } | Error::ResearchModeRefused { .. } => {
+                Severity::Critical
+            }
         }
     }
 
@@ -159,7 +165,7 @@ impl ErrorClass for Error {
             Error::InvalidPool { .. } => 422,
             Error::DirectSwap(_) => 502,
             Error::NotSent(reason) => reason.http_status(),
-            Error::PaperScopeRefused { .. } => 500,
+            Error::PaperScopeRefused { .. } | Error::ResearchModeRefused { .. } => 500,
         }
     }
 }

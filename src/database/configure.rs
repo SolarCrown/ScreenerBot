@@ -157,6 +157,10 @@ pub const POOLS_DB: DbConfig = DbConfig::new(DbPreset::Standard).with_cache_size
 /// ai.db — Cold: LLM-analysis history/instructions (legacy filename)
 pub const AI_DB: DbConfig = DbConfig::new(DbPreset::Cold);
 
+/// research.db — Cold: historical research rows, written by collectors and read
+/// by later backtests. Not the live candle cache.
+pub const RESEARCH_DB: DbConfig = DbConfig::new(DbPreset::Cold);
+
 /// agent_control.db — Cold: client pairings, the external-agent approval queue
 /// and the agent-control audit log. Low write volume, small on disk.
 pub const AGENT_CONTROL_DB: DbConfig = DbConfig::new(DbPreset::Cold);

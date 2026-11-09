@@ -13,7 +13,7 @@ use crate::chains::solana::{Error, Result};
 use crate::secure_storage::{decrypt_private_key, EncryptedData};
 use zeroize::Zeroizing;
 
-use super::signing::refuse_in_paper_scope;
+use super::signing::refuse_key_access;
 
 // =============================================================================
 // IMPORT / EXPORT
@@ -25,15 +25,17 @@ use super::signing::refuse_in_paper_scope;
 /// - Base58 encoded (standard Solana format)
 /// - JSON array format: [1,2,3,...]
 pub fn parse_private_key(private_key: &str) -> Result<Keypair> {
-    refuse_in_paper_scope("parse_private_key")?;
+    refuse_key_access("parse_private_key")?;
     let trimmed = private_key.trim();
 
     // Check for JSON array format
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        parse_array_format(trimmed)
+    let keypair = if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        parse_array_format(trimmed)?
     } else {
-        parse_base58_format(trimmed)
-    }
+        parse_base58_format(trimmed)?
+    };
+    refuse_key_access("parse_private_key")?;
+    Ok(keypair)
 }
 
 /// Parse private key from array format [1,2,3,...]
@@ -90,7 +92,7 @@ fn parse_base58_format(private_key: &str) -> Result<Keypair> {
 ///
 /// The key is wiped from memory when the returned value is dropped.
 pub fn export_private_key(encrypted_key: &str, nonce: &str) -> Result<Zeroizing<String>> {
-    refuse_in_paper_scope("export_private_key")?;
+    refuse_key_access("export_private_key")?;
     let encrypted = EncryptedData {
         ciphertext: encrypted_key.to_string(),
         nonce: nonce.to_string(),
@@ -101,7 +103,7 @@ pub fn export_private_key(encrypted_key: &str, nonce: &str) -> Result<Zeroizing<
 
 /// Decrypt encrypted key and return keypair
 pub fn decrypt_to_keypair(encrypted_key: &str, nonce: &str) -> Result<Keypair> {
-    refuse_in_paper_scope("decrypt_to_keypair")?;
+    refuse_key_access("decrypt_to_keypair")?;
     let private_key = export_private_key(encrypted_key, nonce)?;
     parse_private_key(&private_key)
 }

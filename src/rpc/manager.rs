@@ -793,12 +793,17 @@ fn provider_matches_required_kind(
     required_kind.is_none_or(|kind| provider.kind == kind)
 }
 
-/// Paper trading never sends a transaction: the send is refused before the
-/// relay or any provider is asked. Every other method is unaffected.
+/// Paper trading and research mode never send a transaction: the send is
+/// refused before the relay or any provider is asked. Every other method is
+/// unaffected. Research mode is process-wide, so a spawned task is refused too.
 pub(crate) fn refuse_send_in_paper_scope(method: &str) -> Result<(), RpcError> {
-    if crate::global::in_paper_scope()
-        && matches!(RpcMethod::from_str(method), RpcMethod::SendTransaction)
-    {
+    if !matches!(RpcMethod::from_str(method), RpcMethod::SendTransaction) {
+        return Ok(());
+    }
+    if crate::global::in_research_mode() {
+        return Err(RpcError::ResearchModeRefused);
+    }
+    if crate::global::in_paper_scope() {
         return Err(RpcError::PaperScopeRefused);
     }
     Ok(())
@@ -969,6 +974,19 @@ mod tests {
         assert!(refused.is_request_rejection());
         assert!(!refused.is_retryable());
         assert!(!refused.is_provider_health_failure());
+    }
+
+    #[tokio::test]
+    async fn research_mode_refuses_send_from_a_spawned_task_and_still_allows_reads() {
+        crate::global::engage_research_mode();
+        let send = tokio::spawn(async { refuse_send_in_paper_scope("sendTransaction") })
+            .await
+            .expect("spawn");
+        assert!(matches!(send, Err(RpcError::ResearchModeRefused)));
+        let read = tokio::spawn(async { refuse_send_in_paper_scope("getBalance") })
+            .await
+            .expect("spawn");
+        assert!(read.is_ok());
     }
 
     #[test]
