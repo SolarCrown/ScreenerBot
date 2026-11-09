@@ -32,7 +32,7 @@ pub fn gecko_ohlcv_page(input: GeckoOhlcvPage) -> Result<CandlePage, String> {
         .pointer("/data/attributes/ohlcv_list")
         .and_then(|item| item.as_array())
         .ok_or_else(|| "geckoterminal payload has no data.attributes.ohlcv_list".to_owned())?;
-    let mut candles = Vec::with_capacity(list.len());
+    let mut candles = std::collections::BTreeMap::new();
     for row in list {
         let row = row
             .as_array()
@@ -41,15 +41,19 @@ pub fn gecko_ohlcv_page(input: GeckoOhlcvPage) -> Result<CandlePage, String> {
             return Err(format!("ohlcv row has {} fields", row.len()));
         }
         let ts = json_i64(&row[0]).ok_or_else(|| "ohlcv timestamp is not a number".to_owned())?;
-        candles.push(SourceCandle {
+        candles.insert(
             ts,
-            open: json_f64(&row[1])?,
-            high: json_f64(&row[2])?,
-            low: json_f64(&row[3])?,
-            close: json_f64(&row[4])?,
-            volume: json_f64(&row[5])?,
-        });
+            SourceCandle {
+                ts,
+                open: json_f64(&row[1])?,
+                high: json_f64(&row[2])?,
+                low: json_f64(&row[3])?,
+                close: json_f64(&row[4])?,
+                volume: json_f64(&row[5])?,
+            },
+        );
     }
+    let candles: Vec<_> = candles.into_values().collect();
     Ok(CandlePage {
         source: "geckoterminal".to_owned(),
         params_json: input.params_json,

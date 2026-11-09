@@ -84,6 +84,14 @@ impl Collector {
         }
     }
 
+    pub fn dexscreener() -> Self {
+        Self {
+            pace: Pace::dexscreener(),
+            max_attempts: 3,
+            source: "dexscreener".to_owned(),
+        }
+    }
+
     /// Fetch one payload, waiting on the pace, retrying retryable failures,
     /// and writing health plus an ingest-run row. The store engages research
     /// mode when it was opened.
