@@ -276,6 +276,74 @@ async fn the_geckoterminal_pace_is_one_call_each_six_seconds() {
 }
 
 #[tokio::test]
+#[ignore = "live network"]
+async fn recorded_gecko_history_is_not_marked_profitable_without_reserves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ResearchStore::open_path(
+        &dir.path().join("research.db"),
+        crate::chains::ChainId::Solana,
+    )
+    .unwrap();
+    let pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/day?aggregate=1&limit=1000&currency=usd&token=base"
+    );
+    let raw = client
+        .get(&url)
+        .header("accept", "application/json;version=20230203")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let fetched = Utc::now();
+    let page = gecko_ohlcv_page(GeckoOhlcvPage {
+        mint: "So11111111111111111111111111111111111111112".into(),
+        pool: pool.into(),
+        timeframe: "1d".into(),
+        timeframe_seconds: 86_400,
+        dex_id: "raydium".into(),
+        pool_created_at: None,
+        fetched_at: fetched,
+        raw_payload: raw,
+        params_json: format!(r#"{{"pool":"{pool}","timeframe":"1d"}}"#),
+    })
+    .unwrap();
+    assert!(
+        page.candles.len() > 100,
+        "free daily page was {}",
+        page.candles.len()
+    );
+    store.ingest_candle_page(&page).unwrap();
+    let mut config = crate::research::BacktestConfig::app_fees("gecko-daily", "1d", 86_400);
+    config.entry = crate::research::EntryRule::CloseRise {
+        lookback: 1,
+        min_pct: 0.0,
+    };
+    let report = crate::research::run_backtest(&mut store, &config).unwrap();
+    eprintln!(
+        "gecko daily coverage notes={} fills={} rejected={} unresolved={} start={} end={} hash={}",
+        report.notes,
+        report.fills,
+        report.rejected,
+        report.open_unresolved,
+        report.starting_cash_sol,
+        report.ending_cash_sol,
+        report.data_hash
+    );
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for trade in &report.trades {
+        *reasons.entry(trade.reason.clone()).or_default() += 1;
+    }
+    eprintln!("gecko daily reasons={reasons:?}");
+    assert_eq!(report.fills, 0, "a reserve-less history must not fill");
+    assert_eq!(report.ending_cash_sol, report.starting_cash_sol);
+    assert!(report.rejected > 0);
+}
+
+#[tokio::test]
 async fn retries_are_recorded_and_a_later_success_clears_the_failure_streak() {
     let (_dir, mut store) = store();
     let collector = Collector {

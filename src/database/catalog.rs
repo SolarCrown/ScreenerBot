@@ -488,6 +488,8 @@ pub const RESEARCH: StoreSpec = shared(
         keep("candles", Ledger),
         keep("liquidity_observations", Ledger),
         keep("gaps", Ledger),
+        keep("backtest_runs", Ledger),
+        keep("backtest_trades", Ledger),
     ],
 );
 pub const TRANSACTIONS: StoreSpec = shared(

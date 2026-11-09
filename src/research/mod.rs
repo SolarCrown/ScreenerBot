@@ -14,6 +14,7 @@
 
 mod collect;
 mod parse;
+mod simulate;
 pub(crate) mod store;
 mod venue;
 
@@ -22,6 +23,10 @@ pub use collect::{
 };
 pub use parse::{
     dexscreener_snapshot, gecko_ohlcv_page, rugcheck_report, GeckoOhlcvPage, RugcheckView,
+};
+pub use simulate::{
+    quote_buy, quote_sell, run as run_backtest, BacktestConfig, BacktestReport, EntryRule,
+    HigherTimeframe, APP_NETWORK_FEE_LAMPORTS, APP_PLATFORM_FEE_BPS, APP_PRIORITY_FEE_LAMPORTS,
 };
 pub use store::{
     ingest_snapshot_pairs, CandlePage, IngestOutcome, ResearchStore, SnapshotPair, SourceCandle,
