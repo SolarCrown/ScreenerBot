@@ -63,6 +63,25 @@ fn gecko_candles_keep_the_upstream_timestamp() {
 }
 
 #[test]
+fn a_repeated_ohlcv_timestamp_keeps_the_later_row() {
+    let raw = r#"{"data":{"attributes":{"ohlcv_list":[[100,1,1,1,1,1],[100,2,2,2,3,4]]}}}"#;
+    let page = gecko_ohlcv_page(GeckoOhlcvPage {
+        mint: "Mint".into(),
+        pool: "Pool".into(),
+        timeframe: "1m".into(),
+        timeframe_seconds: 60,
+        dex_id: "raydium".into(),
+        pool_created_at: None,
+        fetched_at: at(),
+        raw_payload: raw.into(),
+        params_json: "{}".into(),
+    })
+    .unwrap();
+    assert_eq!(page.candles.len(), 1);
+    assert_eq!(page.candles[0].close, 3.0);
+}
+
+#[test]
 fn the_same_payload_is_not_stored_twice_and_its_hash_stays() {
     let (_dir, mut store) = store();
     let raw = r#"{"data":{"attributes":{"ohlcv_list":[[100,1,1,1,1,1]]}}}"#;
@@ -387,4 +406,98 @@ async fn retries_are_recorded_and_a_later_success_clears_the_failure_streak() {
     assert_eq!(health.consecutive_failures, 0);
     assert!(health.requests >= 3);
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+#[ignore = "live free-source sample"]
+async fn a_capped_memecoin_sample_backtests_with_real_fills() {
+    let path = std::path::Path::new("data/research-memecoin-sample.db");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let mut store = ResearchStore::open_path(path, crate::chains::ChainId::Solana).unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .build()
+        .unwrap();
+    let picked = collect_memecoin_sample(
+        &mut store,
+        &client,
+        &SampleRequest {
+            network: "solana".into(),
+            native_quote_mint: "So11111111111111111111111111111111111111112".into(),
+            skip_base_mints: vec![
+                "So11111111111111111111111111111111111111112".into(),
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            ],
+            quotas: SampleQuotas {
+                max_pools: 100,
+                one_minute: 40,
+                five_minute: 20,
+                fifteen_minute: 20,
+                one_hour: 20,
+                drained_one_minute: 8,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let mints = store.load_mints().unwrap();
+    let with_born = mints
+        .iter()
+        .filter(|mint| mint.created_at_chain.is_some())
+        .count();
+    let rugged = mints.iter().filter(|mint| mint.status == "rugged").count();
+    eprintln!(
+        "sample picked={picked} mints={} born={} rugged={} dex={:?} gaps={:?}",
+        mints.len(),
+        with_born,
+        rugged,
+        store.pool_dex_counts().unwrap(),
+        store.open_gap_counts().unwrap()
+    );
+    for timeframe in ["1m", "5m", "15m", "1h"] {
+        let candles = store.load_candles(timeframe).unwrap();
+        let distinct = candles
+            .iter()
+            .map(|candle| candle.mint.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let first = candles.first().map(|candle| candle.ts);
+        let last = candles.iter().map(|candle| candle.ts).max();
+        eprintln!(
+            "coverage {timeframe} candles={} mints={distinct} first={first:?} last={last:?}",
+            candles.len()
+        );
+    }
+    let mut config = BacktestConfig::app_fees("memecoin-sample-1m", "1m", 60);
+    config.starting_cash_sol = 2.0;
+    config.order_sol = 0.02;
+    let report = run_backtest(&mut store, &config).unwrap();
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    let mut buys = 0;
+    let mut sells = 0;
+    for trade in &report.trades {
+        *reasons.entry(trade.reason.clone()).or_default() += 1;
+        if trade.side == "buy" {
+            buys += 1;
+        } else if trade.side == "sell" {
+            sells += 1;
+        }
+    }
+    eprintln!(
+        "sanity fills={} buys={buys} sells={sells} rejected={} unresolved={} start={} end={} reasons={reasons:?} notes={} hash={}",
+        report.fills,
+        report.rejected,
+        report.open_unresolved,
+        report.starting_cash_sol,
+        report.ending_cash_sol,
+        report.notes,
+        report.data_hash
+    );
+    assert!(with_born > 0, "pool_created_at should be the born time");
+    assert!(
+        report.fills > 0,
+        "the 1m tail after the reserve snapshot should fill"
+    );
 }

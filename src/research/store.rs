@@ -543,8 +543,58 @@ impl ResearchStore {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn open_gap_counts(&self) -> Result<Vec<(String, i64)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT reason, COUNT(*) FROM gaps
+                 WHERE chain_id = ?1 AND filled = 0
+                 GROUP BY reason ORDER BY reason",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![self.chain.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn pool_dex_counts(&self) -> Result<Vec<(String, i64)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT dex_id, COUNT(*) FROM pools
+                 WHERE chain_id = ?1
+                 GROUP BY dex_id ORDER BY dex_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![self.chain.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn chain_key(&self) -> &str {
         &self.chain
+    }
+
+    pub(crate) fn has_candles(&self, mint: &str, timeframe: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM candles
+                 WHERE chain_id = ?1 AND mint = ?2 AND timeframe = ?3
+                 LIMIT 1",
+                params![self.chain.as_str(), mint, timeframe],
+                |_| Ok(1_i64),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn load_candles(&self, timeframe: &str) -> Result<Vec<StoredCandle>, String> {
