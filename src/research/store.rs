@@ -137,6 +137,41 @@ fn create_schema(tx: &Transaction<'_>, _: &SchemaContext) -> Result<(), Database
         );
         CREATE INDEX IF NOT EXISTS idx_research_gaps_mint
             ON gaps (chain_id, mint, filled, reason);
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id TEXT PRIMARY KEY,
+            strategy_id TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            starting_cash_sol REAL NOT NULL,
+            ending_cash_sol REAL NOT NULL,
+            config_json TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            data_hash TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            trade_count INTEGER NOT NULL,
+            rejected_count INTEGER NOT NULL,
+            open_unresolved INTEGER NOT NULL,
+            notes TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS backtest_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            side TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            signal_ts INTEGER,
+            fill_ts INTEGER,
+            fill_price REAL,
+            size_sol REAL,
+            fee_sol REAL,
+            slippage_pct REAL,
+            cash_after REAL,
+            pnl_sol REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_backtest_trades_run
+            ON backtest_trades (run_id, id);
         ",
     )
 }
@@ -507,6 +542,231 @@ impl ResearchStore {
             .query_row("SELECT COUNT(*) FROM mints", [], |row| row.get(0))
             .map_err(|error| error.to_string())
     }
+
+    pub(crate) fn chain_key(&self) -> &str {
+        &self.chain
+    }
+
+    pub(crate) fn load_candles(&self, timeframe: &str) -> Result<Vec<StoredCandle>, String> {
+        let chain = self.chain.as_str();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mint, pool, ts, open, high, low, close, volume, dataset_hash
+                 FROM candles
+                 WHERE chain_id = ?1 AND timeframe = ?2
+                 ORDER BY mint, ts, dataset_hash",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![chain, timeframe], |row| {
+                Ok(StoredCandle {
+                    mint: row.get(0)?,
+                    pool: row.get(1)?,
+                    ts: row.get(2)?,
+                    open: row.get(3)?,
+                    high: row.get(4)?,
+                    low: row.get(5)?,
+                    close: row.get(6)?,
+                    volume: row.get(7)?,
+                    dataset_hash: row.get(8)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn load_mints(&self) -> Result<Vec<StoredMint>, String> {
+        let chain = self.chain.as_str();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mint, status, status_at, first_seen_at, created_at_chain, venue
+                 FROM mints WHERE chain_id = ?1 ORDER BY mint",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![chain], |row| {
+                Ok(StoredMint {
+                    mint: row.get(0)?,
+                    status: row.get(1)?,
+                    status_at: row.get(2)?,
+                    first_seen_at: row.get(3)?,
+                    created_at_chain: row.get(4)?,
+                    venue: row.get(5)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn load_liquidity(&self) -> Result<Vec<StoredLiquidity>, String> {
+        let chain = self.chain.as_str();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mint, pool, observed_at, reserve_quote, liquidity_usd
+                 FROM liquidity_observations
+                 WHERE chain_id = ?1
+                 ORDER BY mint, observed_at, id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![chain], |row| {
+                Ok(StoredLiquidity {
+                    mint: row.get(0)?,
+                    pool: row.get(1)?,
+                    observed_at: row.get(2)?,
+                    reserve_quote: row.get(3)?,
+                    liquidity_usd: row.get(4)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn save_backtest(
+        &mut self,
+        run: &BacktestRunRow,
+        trades: &[BacktestTradeRow],
+    ) -> Result<(), String> {
+        let tx = self.conn.write_tx().map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM backtest_trades WHERE run_id = ?1",
+            params![run.id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO backtest_runs
+                (id, strategy_id, timeframe, starting_cash_sol, ending_cash_sol, config_json,
+                 config_hash, data_hash, seed, started_at, finished_at, trade_count,
+                 rejected_count, open_unresolved, notes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                run.id,
+                run.strategy_id,
+                run.timeframe,
+                run.starting_cash_sol,
+                run.ending_cash_sol,
+                run.config_json,
+                run.config_hash,
+                run.data_hash,
+                run.seed,
+                run.started_at,
+                run.finished_at,
+                run.trade_count,
+                run.rejected_count,
+                run.open_unresolved,
+                run.notes,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        for trade in trades {
+            tx.execute(
+                "INSERT INTO backtest_trades
+                    (run_id, strategy_id, mint, side, reason, signal_ts, fill_ts, fill_price,
+                     size_sol, fee_sol, slippage_pct, cash_after, pnl_sol)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    run.id,
+                    run.strategy_id,
+                    trade.mint,
+                    trade.side,
+                    trade.reason,
+                    trade.signal_ts,
+                    trade.fill_ts,
+                    trade.fill_price,
+                    trade.size_sol,
+                    trade.fee_sol,
+                    trade.slippage_pct,
+                    trade.cash_after,
+                    trade.pnl_sol,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn backtest_trade_count(&self, run_id: &str) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM backtest_trades WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// One stored candle. The backtester picks one row per timestamp.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredCandle {
+    pub mint: String,
+    pub pool: String,
+    pub ts: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub dataset_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredMint {
+    pub mint: String,
+    pub status: String,
+    pub status_at: String,
+    pub first_seen_at: String,
+    pub created_at_chain: Option<String>,
+    pub venue: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredLiquidity {
+    pub mint: String,
+    pub pool: Option<String>,
+    pub observed_at: String,
+    pub reserve_quote: Option<f64>,
+    pub liquidity_usd: Option<f64>,
+}
+
+pub(crate) struct BacktestRunRow {
+    pub id: String,
+    pub strategy_id: String,
+    pub timeframe: String,
+    pub starting_cash_sol: f64,
+    pub ending_cash_sol: f64,
+    pub config_json: String,
+    pub config_hash: String,
+    pub data_hash: String,
+    pub seed: i64,
+    pub started_at: String,
+    pub finished_at: String,
+    pub trade_count: i64,
+    pub rejected_count: i64,
+    pub open_unresolved: i64,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BacktestTradeRow {
+    pub mint: String,
+    pub side: String,
+    pub reason: String,
+    pub signal_ts: Option<i64>,
+    pub fill_ts: Option<i64>,
+    pub fill_price: Option<f64>,
+    pub size_sol: Option<f64>,
+    pub fee_sol: Option<f64>,
+    pub slippage_pct: Option<f64>,
+    pub cash_after: Option<f64>,
+    pub pnl_sol: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
